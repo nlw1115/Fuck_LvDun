@@ -112,8 +112,16 @@ public static class FileCheckerEngineV5 {
             
             Console.WriteLine("\rScanned: " + _scannedCount + " files | Encrypted: " + _encryptedCount);
             Console.WriteLine();
+        } catch (AggregateException aex) {
+            Console.WriteLine("\n扫描过程中发生错误 (AggregateException):");
+            foreach (var inner in aex.Flatten().InnerExceptions) {
+                Console.WriteLine("  " + inner.GetType().FullName + ": " + inner.Message);
+                if (inner is IOException || inner is UnauthorizedAccessException) {
+                    Console.WriteLine("    Path-related error, continue scanning...");
+                }
+            }
         } catch (Exception ex) {
-            Console.WriteLine("\n扫描过程中发生错误: " + ex.Message);
+            Console.WriteLine("\n扫描过程中发生错误: " + ex.ToString());
         }
 
         return encryptedFiles.ToArray();
@@ -154,9 +162,7 @@ public static class FileCheckerEngineV5 {
 
     private static bool LooksLikeEncryptedByHeuristic(byte[] buffer, int bytesRead) {
         if (bytesRead <= 0) return false;
-        for (int i = 0; i < bytesRead; i++) {
-            if (buffer[i] == 0) return true;
-        }
+        // 移除"含0即加密"的激进判断，避免误判正常二进制文件
         int controlCount = 0;
         for (int i = 0; i < bytesRead; i++) {
             byte b = buffer[i];
@@ -206,32 +212,27 @@ public static class FileCheckerEngineV5 {
                     return false;
                 }
 
-                // 图片格式：有标准魔数则视为未加密（PNG/JPEG/GIF/BMP/WebP 等合法二进制含大量 0x00，不能靠启发式判加密）
-                if (ext.Equals(".png", StringComparison.OrdinalIgnoreCase) &&
-                    StartsWithBytes(header, headerRead, new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A })) {
-                    return false;
-                }
-                if ((ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase) || ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase))) {
-                    if (headerRead >= 3 && header[0] == 0xFF && header[1] == 0xD8 && header[2] == 0xFF) return false;  // JPEG
-                    if (StartsWithBytes(header, headerRead, new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A })) return false;  // 误用 .jpg 的 PNG
-                }
-                if (ext.Equals(".gif", StringComparison.OrdinalIgnoreCase) &&
-                    (StartsWithBytes(header, headerRead, new byte[] { 0x47, 0x49, 0x46, 0x38, 0x37, 0x61 }) ||
-                     StartsWithBytes(header, headerRead, new byte[] { 0x47, 0x49, 0x46, 0x38, 0x39, 0x61 }))) {
-                    return false;
-                }
-                if (ext.Equals(".bmp", StringComparison.OrdinalIgnoreCase) &&
-                    StartsWithBytes(header, headerRead, new byte[] { 0x42, 0x4D })) {
-                    return false;
-                }
-                if (ext.Equals(".webp", StringComparison.OrdinalIgnoreCase) && headerRead >= 12 &&
-                    header[0] == 0x52 && header[1] == 0x49 && header[2] == 0x46 && header[3] == 0x46 &&
-                    header[8] == 0x57 && header[9] == 0x45 && header[10] == 0x42 && header[11] == 0x50) {
-                    return false;
-                }
-                if (ext.Equals(".ico", StringComparison.OrdinalIgnoreCase) && headerRead >= 4 &&
-                    header[0] == 0x00 && header[1] == 0x00 && header[2] == 0x01 && header[3] == 0x00) {
-                    return false;
+                // 图片格式：统一检查常见图片魔数，支持扩展名不匹配的情况（例如 .png 实为 .jpg）
+                bool isImage = false;
+                if (StartsWithBytes(header, headerRead, new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A })) isImage = true; // PNG
+                else if (headerRead >= 3 && header[0] == 0xFF && header[1] == 0xD8 && header[2] == 0xFF) isImage = true; // JPEG
+                else if (StartsWithBytes(header, headerRead, new byte[] { 0x47, 0x49, 0x46, 0x38, 0x37, 0x61 }) || 
+                         StartsWithBytes(header, headerRead, new byte[] { 0x47, 0x49, 0x46, 0x38, 0x39, 0x61 })) isImage = true; // GIF
+                else if (StartsWithBytes(header, headerRead, new byte[] { 0x42, 0x4D })) isImage = true; // BMP
+                else if (headerRead >= 12 &&
+                         header[0] == 0x52 && header[1] == 0x49 && header[2] == 0x46 && header[3] == 0x46 &&
+                         header[8] == 0x57 && header[9] == 0x45 && header[10] == 0x42 && header[11] == 0x50) isImage = true; // WebP
+                else if (headerRead >= 4 &&
+                         header[0] == 0x00 && header[1] == 0x00 && header[2] == 0x01 && header[3] == 0x00) isImage = true; // ICO
+
+                if ((ext.Equals(".png", StringComparison.OrdinalIgnoreCase) ||
+                     ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase) ||
+                     ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase) ||
+                     ext.Equals(".gif", StringComparison.OrdinalIgnoreCase) ||
+                     ext.Equals(".bmp", StringComparison.OrdinalIgnoreCase) ||
+                     ext.Equals(".webp", StringComparison.OrdinalIgnoreCase) ||
+                     ext.Equals(".ico", StringComparison.OrdinalIgnoreCase))) {
+                     if (isImage) return false;
                 }
 
                 // 文本格式：UTF-16/UTF-8 BOM 或控制字符占比低，视为未加密（UTF-16 含大量 0x00、含 null 的文本均合法）
@@ -312,60 +313,113 @@ import tempfile
 MAX_WORKERS = $MaxWorkers
 FILE_LIST_PATH = r'$FileListFile'
 
-# 辅助批处理路径，在 main() 里初始化；批处理从两个临时文件读源/目标路径再 move，路径不经过 cmd 命令行解析
+# 辅助批处理路径，在 main() 里初始化；批处理从 ops 文件读 src/dst 并批量 move
 MOVE_HELPER_BAT = None
 
 def _make_move_helper_bat():
-    """创建辅助批处理：%1=存源路径的文件，%2=存目标路径的文件；内部用 set /p 读取再 move，避免路径中的中文、逗号等被 cmd 解析。"""
+    """创建辅助批处理：%1=ops 文件（GBK），奇数行=src，偶数行=dst；内部批量 move 并输出 OK/FAIL。
+    这样只启动一次 cmd，避免“每文件一次 cmd + 多个临时文件”带来的开销，同时仍使用 cmd move 触发系统钩子解密。
+    """
     fd, path = tempfile.mkstemp(suffix='.bat')
     try:
         with os.fdopen(fd, 'w', newline='\r\n', encoding='ascii') as f:
             f.write('@echo off\r\n')
-            f.write('setlocal enabledelayedexpansion\r\n')
-            f.write('set "f1=%~1"\r\n')
-            f.write('set "f2=%~2"\r\n')
-            f.write('set /p "src=" < "!f1!"\r\n')
-            f.write('set /p "dst=" < "!f2!"\r\n')
-            f.write('move /y "!src!" "!dst!"\r\n')
+            f.write('setlocal DisableDelayedExpansion\r\n')
+            f.write('set "ops=%~1"\r\n')
+            f.write('if "%ops%"=="" exit /b 2\r\n')
+            f.write('set "src="\r\n')
+            f.write('set "dst="\r\n')
+            f.write('set state=0\r\n')
+            f.write('for /f "usebackq delims= eol=" %%L in ("%ops%") do call :handleLine "%%L"\r\n')
+            f.write('exit /b 0\r\n')
+            f.write(':handleLine\r\n')
+            f.write('if "%state%"=="1" goto doMove\r\n')
+            f.write('set "src=%~1"\r\n')
+            f.write('set state=1\r\n')
+            f.write('exit /b\r\n')
+            f.write(':doMove\r\n')
+            f.write('set "dst=%~1"\r\n')
+            f.write('setlocal EnableDelayedExpansion\r\n')
+            f.write('move /y "!src!" "!dst!" >nul 2>&1\r\n')
+            f.write('if errorlevel 1 (\r\n')
+            f.write('  echo FAIL !errorlevel! "!dst!"\r\n')
+            f.write(') else (\r\n')
+            f.write('  echo OK "!dst!"\r\n')
+            f.write(')\r\n')
+            f.write('endlocal\r\n')
+            f.write('set state=0\r\n')
+            f.write('exit /b\r\n')
         return path
     except Exception:
         os.close(fd)
         raise
 
-def _cmd_move_via_files(helper_bat, src_path, dst_path, startupinfo):
-    """通过辅助批处理执行 move：把源/目标路径写入两个临时文件，批处理从文件读取后执行 move。"""
-    enc = 'gbk'  # cmd set /p 使用系统代码页，中文 Windows 一般为 GBK
-    fsrc = None
-    fdst = None
+def _run_cmd_move_batch(helper_bat, pairs, startupinfo):
+    """批量执行 cmd move：pairs=[(src_tmp, dst), ...]。
+    返回 (ok_dsts:set, fail_info:list[(code:int, dst:str)])。
+    """
+    enc = 'gbk'  # cmd 读取 bat 输出/以及 ops 文件时的常见代码页（中文 Windows 一般为 GBK）
+    ops_path = None
     try:
-        fd1, fsrc = tempfile.mkstemp(suffix='.txt'); os.close(fd1)
-        fd2, fdst = tempfile.mkstemp(suffix='.txt'); os.close(fd2)
-        with open(fsrc, 'w', encoding=enc, newline='\n') as f:
-            f.write(src_path)
-        with open(fdst, 'w', encoding=enc, newline='\n') as f:
-            f.write(dst_path)
-        subprocess.run(
-            ['cmd', '/c', helper_bat, fsrc, fdst],
-            check=True,
+        fd, ops_path = tempfile.mkstemp(suffix='.ops'); os.close(fd)
+        with open(ops_path, 'w', encoding=enc, newline='\r\n') as f:
+            for src, dst in pairs:
+                f.write(src + '\r\n')
+                f.write(dst + '\r\n')
+
+        proc = subprocess.run(
+            ['cmd', '/c', helper_bat, ops_path],
+            check=False,
             startupinfo=startupinfo,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
-    finally:
-        for p in (fsrc, fdst):
-            if p and os.path.exists(p):
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
 
-def refresh_file(file_path):
+        out = (proc.stdout or b'').decode(enc, errors='ignore')
+        ok = set()
+        fail = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # OK "dst"
+            if line.startswith('OK '):
+                q1 = line.find('"')
+                q2 = line.rfind('"')
+                if q1 != -1 and q2 > q1:
+                    ok.add(line[q1+1:q2])
+                continue
+            # FAIL <code> "dst"
+            if line.startswith('FAIL '):
+                parts = line.split(' ', 2)
+                if len(parts) >= 2:
+                    try:
+                        code = int(parts[1])
+                    except Exception:
+                        code = 1
+                else:
+                    code = 1
+                q1 = line.find('"')
+                q2 = line.rfind('"')
+                dst = None
+                if q1 != -1 and q2 > q1:
+                    dst = line[q1+1:q2]
+                if dst:
+                    fail.append((code, dst))
+                continue
+        return ok, fail
+    finally:
+        if ops_path and os.path.exists(ops_path):
+            try:
+                os.remove(ops_path)
+            except Exception:
+                pass
+
+def _prepare_temp(file_path):
     """
-    读取并原位写回文件。
-    策略：Python 读取 (获取明文) -> 写临时文件 -> 用 cmd move 覆盖以触发系统钩子解密。
-    通过辅助批处理从临时文件读路径再 move，路径不经过命令行解析，避免中文、逗号等导致“文件名、目录名或卷标语法不正确”。
+    读取并写出临时文件（不做 move）。
+    返回 (temp_path, file_path, ext_lower) 或 None。
     """
-    global MOVE_HELPER_BAT
     try:
         file_path = file_path.strip()
         if not file_path: return None
@@ -393,28 +447,7 @@ def refresh_file(file_path):
         except Exception:
             pass
 
-        # 4. 用 cmd move 覆盖（必须走 cmd 才能触发系统钩子解密）。通过辅助批处理从文件读路径，避免命令行解析问题。
-        try:
-            _cmd_move_via_files(MOVE_HELPER_BAT, temp_path, file_path, startupinfo)
-        except subprocess.CalledProcessError as e:
-            out = (e.stdout or b"")
-            err = (e.stderr or b"")
-            try:
-                out_s = out.decode("gbk", errors="ignore").strip()
-            except Exception:
-                out_s = ""
-            try:
-                err_s = err.decode("gbk", errors="ignore").strip()
-            except Exception:
-                err_s = ""
-            msg = f"cmd move 失败，退出码 {e.returncode}"
-            if out_s:
-                msg += f" | stdout: {out_s}"
-            if err_s:
-                msg += f" | stderr: {err_s}"
-            raise RuntimeError(msg) from e
-
-        return os.path.splitext(file_path)[1].lower()
+        return temp_path, file_path, os.path.splitext(file_path)[1].lower()
     except Exception as e:
         print(f"处理失败: {file_path} - {e}")
         # 如果失败，尝试清理临时文件
@@ -455,17 +488,53 @@ def main():
     start_time = time.time()
     
     try:
-        # 使用线程池并发执行 cmd 覆盖
+        # 1) 并行生成 .tmp（读取明文 + 写临时文件）
+        pairs = []
+        ext_by_dst = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_file = {executor.submit(refresh_file, f): f for f in files}
-            
+            future_to_file = {executor.submit(_prepare_temp, f): f for f in files}
             for future in concurrent.futures.as_completed(future_to_file):
-                file_path = future_to_file[future]
-                ext = future.result()
-                if ext:
-                    print(f"已解密: {file_path}")
-                    success_count += 1
-                    stats[ext] = stats.get(ext, 0) + 1
+                res = future.result()
+                if res:
+                    tmp_path, dst_path, ext = res
+                    pairs.append((tmp_path, dst_path))
+                    ext_by_dst[dst_path] = ext
+
+        if not pairs:
+            end_time = time.time()
+            duration = end_time - start_time
+            print("\n" + "=" * 30)
+            print("       解密结果统计       ")
+            print("=" * 30)
+            print("-" * 30)
+            print(f"成功解密: 0 / {len(files)}")
+            print(f"耗时: {duration:.2f} 秒")
+            return
+
+        # 2) 单次 cmd 批量 move 覆盖（触发系统钩子解密）
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        ok_dsts, fail_info = _run_cmd_move_batch(MOVE_HELPER_BAT, pairs, startupinfo)
+
+        fail_set = set()
+        for code, dst in fail_info:
+            fail_set.add(dst)
+            print(f"处理失败: {dst} - cmd move 失败，退出码 {code}")
+
+        for dst in ok_dsts:
+            ext = ext_by_dst.get(dst)
+            if ext:
+                print(f"已解密: {dst}")
+                success_count += 1
+                stats[ext] = stats.get(ext, 0) + 1
+
+        # 3) 清理 move 失败遗留的 .tmp
+        for tmp, dst in pairs:
+            if dst in fail_set and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
 
         end_time = time.time()
         duration = end_time - start_time
