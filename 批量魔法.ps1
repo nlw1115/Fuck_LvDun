@@ -29,6 +29,13 @@ $TargetExtensions = @(
     ".docx",
     ".pptx",
     ".xls",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".bmp",
+    ".webp",
+    ".ico",
     ".xlsx",
     ".pdf"
 )
@@ -63,7 +70,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Linq;
 
-public static class FileCheckerEngineV4 {
+public static class FileCheckerEngineV5 {
     private static int _scannedCount = 0;
     private static int _encryptedCount = 0;
     public static int ScannedCount { get { return _scannedCount; } }
@@ -198,6 +205,53 @@ public static class FileCheckerEngineV4 {
                     StartsWithBytes(header, headerRead, new byte[] { 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1 })) {
                     return false;
                 }
+
+                // 图片格式：有标准魔数则视为未加密（PNG/JPEG/GIF/BMP/WebP 等合法二进制含大量 0x00，不能靠启发式判加密）
+                if (ext.Equals(".png", StringComparison.OrdinalIgnoreCase) &&
+                    StartsWithBytes(header, headerRead, new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A })) {
+                    return false;
+                }
+                if ((ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase) || ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase))) {
+                    if (headerRead >= 3 && header[0] == 0xFF && header[1] == 0xD8 && header[2] == 0xFF) return false;  // JPEG
+                    if (StartsWithBytes(header, headerRead, new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A })) return false;  // 误用 .jpg 的 PNG
+                }
+                if (ext.Equals(".gif", StringComparison.OrdinalIgnoreCase) &&
+                    (StartsWithBytes(header, headerRead, new byte[] { 0x47, 0x49, 0x46, 0x38, 0x37, 0x61 }) ||
+                     StartsWithBytes(header, headerRead, new byte[] { 0x47, 0x49, 0x46, 0x38, 0x39, 0x61 }))) {
+                    return false;
+                }
+                if (ext.Equals(".bmp", StringComparison.OrdinalIgnoreCase) &&
+                    StartsWithBytes(header, headerRead, new byte[] { 0x42, 0x4D })) {
+                    return false;
+                }
+                if (ext.Equals(".webp", StringComparison.OrdinalIgnoreCase) && headerRead >= 12 &&
+                    header[0] == 0x52 && header[1] == 0x49 && header[2] == 0x46 && header[3] == 0x46 &&
+                    header[8] == 0x57 && header[9] == 0x45 && header[10] == 0x42 && header[11] == 0x50) {
+                    return false;
+                }
+                if (ext.Equals(".ico", StringComparison.OrdinalIgnoreCase) && headerRead >= 4 &&
+                    header[0] == 0x00 && header[1] == 0x00 && header[2] == 0x01 && header[3] == 0x00) {
+                    return false;
+                }
+
+                // 文本格式：UTF-16/UTF-8 BOM 或控制字符占比低，视为未加密（UTF-16 含大量 0x00、含 null 的文本均合法）
+                if ((ext.Equals(".txt", StringComparison.OrdinalIgnoreCase) || ext.Equals(".csv", StringComparison.OrdinalIgnoreCase) ||
+                     ext.Equals(".md", StringComparison.OrdinalIgnoreCase) || ext.Equals(".py", StringComparison.OrdinalIgnoreCase) ||
+                     ext.Equals(".c", StringComparison.OrdinalIgnoreCase) || ext.Equals(".h", StringComparison.OrdinalIgnoreCase) ||
+                     ext.Equals(".cpp", StringComparison.OrdinalIgnoreCase) || ext.Equals(".cc", StringComparison.OrdinalIgnoreCase) ||
+                     ext.Equals(".pyx", StringComparison.OrdinalIgnoreCase) || ext.Equals(".pxd", StringComparison.OrdinalIgnoreCase) ||
+                     ext.Equals(".cs", StringComparison.OrdinalIgnoreCase) || ext.Equals(".config", StringComparison.OrdinalIgnoreCase) ||
+                     ext.Equals(".csproj", StringComparison.OrdinalIgnoreCase) || ext.Equals(".f", StringComparison.OrdinalIgnoreCase) ||
+                     ext.Equals(".hpp", StringComparison.OrdinalIgnoreCase))) {
+                    if (headerRead >= 2 && header[0] == 0xFF && header[1] == 0xFE) return false;  // UTF-16 LE BOM
+                    if (headerRead >= 2 && header[0] == 0xFE && header[1] == 0xFF) return false;  // UTF-16 BE BOM
+                    if (headerRead >= 3 && header[0] == 0xEF && header[1] == 0xBB && header[2] == 0xBF) return false;  // UTF-8 BOM
+                    int ctrlCount = 0;
+                    for (int i = 0; i < headerRead; i++) {
+                        if (header[i] < 32 && header[i] != 9 && header[i] != 10 && header[i] != 13) ctrlCount++;
+                    }
+                    if (((double)ctrlCount / headerRead) <= 0.15) return false;  // 控制字符少，视为明文
+                }
             }
 
             return LooksLikeEncryptedByHeuristic(header, headerRead);
@@ -208,7 +262,7 @@ public static class FileCheckerEngineV4 {
 }
 '
 
-if (-not ("FileCheckerEngineV4" -as [type])) {
+if (-not ("FileCheckerEngineV5" -as [type])) {
     Add-Type -TypeDefinition $csharpSource
 }
 
@@ -220,18 +274,18 @@ $FilesToDecrypt = @()
 
 if ((Get-Item $AbsInputPath).PSIsContainer) {
     # 使用 C# 静态方法进行全速扫描
-    $FilesToDecrypt = [FileCheckerEngineV4]::FastScan($AbsInputPath, $TargetExtensions)
+    $FilesToDecrypt = [FileCheckerEngineV5]::FastScan($AbsInputPath, $TargetExtensions)
 } else {
     # 单个文件
     if ($AbsInputPath.ToLower().Substring($AbsInputPath.LastIndexOf(".")) -in $TargetExtensions) {
-        if ([FileCheckerEngineV4]::IsEncrypted($AbsInputPath)) {
+        if ([FileCheckerEngineV5]::IsEncrypted($AbsInputPath)) {
             $FilesToDecrypt += $AbsInputPath
         }
     }
 }
 
 Write-Progress -Activity "正在扫描" -Completed
-$TotalScanned = [FileCheckerEngineV4]::ScannedCount
+$TotalScanned = if ((Get-Item $AbsInputPath).PSIsContainer) { [FileCheckerEngineV5]::ScannedCount } else { 1 }
 
 if ($FilesToDecrypt.Count -eq 0) {
     Write-Host "扫描完成。未发现加密文件 (共扫描 $TotalScanned 个文件)。" -ForegroundColor Green
@@ -253,18 +307,65 @@ import concurrent.futures
 import time
 import subprocess
 import stat
+import tempfile
 
 MAX_WORKERS = $MaxWorkers
 FILE_LIST_PATH = r'$FileListFile'
 
+# 辅助批处理路径，在 main() 里初始化；批处理从两个临时文件读源/目标路径再 move，路径不经过 cmd 命令行解析
+MOVE_HELPER_BAT = None
+
+def _make_move_helper_bat():
+    """创建辅助批处理：%1=存源路径的文件，%2=存目标路径的文件；内部用 set /p 读取再 move，避免路径中的中文、逗号等被 cmd 解析。"""
+    fd, path = tempfile.mkstemp(suffix='.bat')
+    try:
+        with os.fdopen(fd, 'w', newline='\r\n', encoding='ascii') as f:
+            f.write('@echo off\r\n')
+            f.write('setlocal enabledelayedexpansion\r\n')
+            f.write('set "f1=%~1"\r\n')
+            f.write('set "f2=%~2"\r\n')
+            f.write('set /p "src=" < "!f1!"\r\n')
+            f.write('set /p "dst=" < "!f2!"\r\n')
+            f.write('move /y "!src!" "!dst!"\r\n')
+        return path
+    except Exception:
+        os.close(fd)
+        raise
+
+def _cmd_move_via_files(helper_bat, src_path, dst_path, startupinfo):
+    """通过辅助批处理执行 move：把源/目标路径写入两个临时文件，批处理从文件读取后执行 move。"""
+    enc = 'gbk'  # cmd set /p 使用系统代码页，中文 Windows 一般为 GBK
+    fsrc = None
+    fdst = None
+    try:
+        fd1, fsrc = tempfile.mkstemp(suffix='.txt'); os.close(fd1)
+        fd2, fdst = tempfile.mkstemp(suffix='.txt'); os.close(fd2)
+        with open(fsrc, 'w', encoding=enc, newline='\n') as f:
+            f.write(src_path)
+        with open(fdst, 'w', encoding=enc, newline='\n') as f:
+            f.write(dst_path)
+        subprocess.run(
+            ['cmd', '/c', helper_bat, fsrc, fdst],
+            check=True,
+            startupinfo=startupinfo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+    finally:
+        for p in (fsrc, fdst):
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
 def refresh_file(file_path):
     """
     读取并原位写回文件。
-    策略优化：
-    1. Python 读取文件内容 (获取明文) 并写入临时文件。
-    2. 使用 cmd.exe 的 move 命令进行覆盖。
-       (cmd.exe 启动速度远快于 PowerShell，且能达到同样的“外部进程覆盖”效果)
+    策略：Python 读取 (获取明文) -> 写临时文件 -> 用 cmd move 覆盖以触发系统钩子解密。
+    通过辅助批处理从临时文件读路径再 move，路径不经过命令行解析，避免中文、逗号等导致“文件名、目录名或卷标语法不正确”。
     """
+    global MOVE_HELPER_BAT
     try:
         file_path = file_path.strip()
         if not file_path: return None
@@ -278,14 +379,9 @@ def refresh_file(file_path):
         with open(temp_path, 'wb') as f:
             f.write(data)
             
-        # 3. 使用 cmd.exe 覆盖
-        # cmd /c move /y "temp" "dest"
-        # 注意：cmd 对路径中的特殊字符处理较弱，但一般路径没问题。
-        # 如果路径包含空格，需要用引号包裹。
-        
+        # 3. 去掉只读（若有）
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
         try:
             subprocess.run(
                 ['attrib', '-R', file_path],
@@ -297,16 +393,9 @@ def refresh_file(file_path):
         except Exception:
             pass
 
-        cmd = ['cmd', '/c', 'move', '/y', temp_path, file_path]
-        
+        # 4. 用 cmd move 覆盖（必须走 cmd 才能触发系统钩子解密）。通过辅助批处理从文件读路径，避免命令行解析问题。
         try:
-            subprocess.run(
-                cmd,
-                check=True,
-                startupinfo=startupinfo,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
+            _cmd_move_via_files(MOVE_HELPER_BAT, temp_path, file_path, startupinfo)
         except subprocess.CalledProcessError as e:
             out = (e.stdout or b"")
             err = (e.stderr or b"")
@@ -324,7 +413,7 @@ def refresh_file(file_path):
             if err_s:
                 msg += f" | stderr: {err_s}"
             raise RuntimeError(msg) from e
-            
+
         return os.path.splitext(file_path)[1].lower()
     except Exception as e:
         print(f"处理失败: {file_path} - {e}")
@@ -348,35 +437,53 @@ def main():
         print(f"无法读取文件列表: {e}")
         return
 
+    global MOVE_HELPER_BAT
+    if os.name == 'nt':
+        try:
+            MOVE_HELPER_BAT = _make_move_helper_bat()
+        except Exception as e:
+            print(f"创建 move 辅助批处理失败: {e}")
+            return
+    else:
+        print("当前仅支持 Windows 下通过 cmd move 触发解密。")
+        return
+
     print(f"Python 引擎启动。正在批量解密 {len(files)} 个文件 (线程数: {MAX_WORKERS})...")
     
     stats = {}
     success_count = 0
     start_time = time.time()
     
-    # 使用线程池并发执行 cmd 覆盖
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_file = {executor.submit(refresh_file, f): f for f in files}
-        
-        for future in concurrent.futures.as_completed(future_to_file):
-            file_path = future_to_file[future]
-            ext = future.result()
-            if ext:
-                print(f"已解密: {file_path}")
-                success_count += 1
-                stats[ext] = stats.get(ext, 0) + 1
+    try:
+        # 使用线程池并发执行 cmd 覆盖
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_file = {executor.submit(refresh_file, f): f for f in files}
+            
+            for future in concurrent.futures.as_completed(future_to_file):
+                file_path = future_to_file[future]
+                ext = future.result()
+                if ext:
+                    print(f"已解密: {file_path}")
+                    success_count += 1
+                    stats[ext] = stats.get(ext, 0) + 1
 
-    end_time = time.time()
-    duration = end_time - start_time
-    
-    print("\n" + "=" * 30)
-    print("       解密结果统计       ")
-    print("=" * 30)
-    for ext, count in stats.items():
-        print(f"{ext:<6} 文件数: {count}")
-    print("-" * 30)
-    print(f"成功解密: {success_count} / {len(files)}")
-    print(f"耗时: {duration:.2f} 秒")
+        end_time = time.time()
+        duration = end_time - start_time
+        
+        print("\n" + "=" * 30)
+        print("       解密结果统计       ")
+        print("=" * 30)
+        for ext, count in stats.items():
+            print(f"{ext:<6} 文件数: {count}")
+        print("-" * 30)
+        print(f"成功解密: {success_count} / {len(files)}")
+        print(f"耗时: {duration:.2f} 秒")
+    finally:
+        if MOVE_HELPER_BAT and os.path.exists(MOVE_HELPER_BAT):
+            try:
+                os.remove(MOVE_HELPER_BAT)
+            except Exception:
+                pass
 
 if __name__ == '__main__':
     main()
